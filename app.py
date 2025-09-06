@@ -1,653 +1,205 @@
 # app.py
+import base64, io, math
+from typing import List, Tuple, Dict
+import numpy as np
+import cv2
 from flask import Flask, request, jsonify
-import re
-import math
-import os
 
 app = Flask(__name__)
-# keep Unicode characters (Chinese, German umlauts) in JSON responses
-app.config["JSON_AS_ASCII"] = False
+
+def _b64_to_cv(img_b64: str):
+    raw = base64.b64decode(img_b64.split(",")[-1], validate=False)
+    arr = np.frombuffer(raw, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-# =========================
-#        DUOLINGO SORT
-# =========================
-# ---- Roman numerals ----
-_ROM = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
-_ROM_RE = re.compile(r"^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$")
+def _dist(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
+class DSU:
+    def __init__(self, n): self.p=list(range(n)); self.r=[0]*n
+    def find(self,x):
+        while self.p[x]!=x:
+            self.p[x]=self.p[self.p[x]]; x=self.p[x]
+        return x
+    def union(self,a,b):
+        pa,pb=self.find(a),self.find(b)
+        if pa==pb: return False
+        if self.r[pa]<self.r[pb]: pa,pb=pb,pa
+        self.p[pb]=pa
+        if self.r[pa]==self.r[pb]: self.r[pa]+=1
+        return True
 
-def roman_to_int(s: str) -> int:
-    if not s:
-        raise ValueError("not roman")
-    s = s.strip().upper()
-    if not _ROM_RE.match(s):
-        raise ValueError("not roman")
-    total = 0
-    for i, ch in enumerate(s):
-        v = _ROM[ch]
-        if i + 1 < len(s) and _ROM[s[i + 1]] > v:
-            total -= v
-        else:
-            total += v
+def _mst_weight(n_nodes: int, edges: List[Tuple[int,int,int]]) -> int:
+    edges = sorted(edges, key=lambda e: e[2])
+    dsu = DSU(n_nodes)
+    total = used = 0
+    for u,v,w in edges:
+        if dsu.union(u,v):
+            total += int(w); used += 1
+            if used == n_nodes - 1: break
     return total
 
+def _detect_nodes(img_bgr: np.ndarray) -> List[Tuple[int,int,int]]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9,9), 1.5)
+    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=25,
+                               param1=100, param2=18, minRadius=6, maxRadius=28)
+    out=[]
+    if circles is not None:
+        for c in np.uint16(np.around(circles))[0, :]:
+            out.append((int(c[0]), int(c[1]), int(c[2])))
+    if len(out)<3:
+        _, bw = cv2.threshold(gray, 45, 255, cv2.THRESH_BINARY_INV)
+        bw = cv2.medianBlur(bw, 5)
+        cnts,_ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            (x,y), r = cv2.minEnclosingCircle(c)
+            if 6<=r<=28: out.append((int(x),int(y),int(r)))
+    dedup=[]
+    for x,y,r in out:
+        if all(_dist((x,y),(a,b))>10 for a,b,_ in dedup): dedup.append((x,y,r))
+    return dedup
 
-# ---- English words ----
-_UNITS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19
-}
-_TENS = {
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90
-}
-# only scales needed by the challenge
-_SCALES = {"hundred": 100, "thousand": 1000, "million": 1_000_000, "billion": 1_000_000_000}
+def _detect_line_segments(img_bgr: np.ndarray):
+    g=cv2.cvtColor(img_bgr,cv2.COLOR_BGR2GRAY)
+    g=cv2.bilateralFilter(g,7,50,50)
+    e=cv2.Canny(g,50,120,L2gradient=True)
+    segs=cv2.HoughLinesP(e,1,np.pi/180,threshold=60,minLineLength=35,maxLineGap=8)
+    return [] if segs is None else [tuple(map(int,s[0])) for s in segs]
 
+def _segments_to_edges(nodes, segs, shape):
+    centers=[(x,y) for x,y,_ in nodes]
+    pairs=[]
+    for i in range(len(centers)):
+        for j in range(i+1,len(centers)):
+            a,b=centers[i],centers[j]
+            if _dist(a,b)<25: continue
+            support=0
+            for x1,y1,x2,y2 in segs:
+                mx,my=(x1+x2)/2.0,(y1+y2)/2.0
+                ax,ay=a; bx,by=b
+                AB=np.array([bx-ax,by-ay],np.float32)
+                AP=np.array([mx-ax,my-ay],np.float32)
+                ABn=AB/(np.linalg.norm(AB)+1e-6)
+                perp=np.linalg.norm(AP-ABn*np.dot(AP,ABn))
+                on_span=0<=np.dot(AP,ABn)<=np.linalg.norm(AB)+5
+                if on_span and perp<6.0: support+=1
+            if support>=1:
+                pairs.append((i,j,((centers[i][0]+centers[j][0])//2,
+                                   (centers[i][1]+centers[j][1])//2)))
+    return pairs
 
-def english_to_int(s: str) -> int:
-    if not s:
-        raise ValueError("not english")
-    t = s.lower().replace("-", " ").split()
-    total, cur = 0, 0
-    for w in t:
-        if w == "and":
-            continue
-        if w in _UNITS:
-            cur += _UNITS[w]
-        elif w in _TENS:
-            cur += _TENS[w]
-        elif w == "hundred":
-            if cur == 0:
-                cur = 1
-            cur *= 100
-        elif w in ("thousand", "million", "billion"):
-            if cur == 0:
-                cur = 1
-            total += cur * _SCALES[w]
-            cur = 0
-        else:
-            raise ValueError("not english")
-    return total + cur
+_DIGIT_TEMPLATES=None
+def _make_digit_templates():
+    global _DIGIT_TEMPLATES
+    if _DIGIT_TEMPLATES is not None: return _DIGIT_TEMPLATES
+    scales=[0.8,1.0,1.2]; thicks=[2,3]; templates={d:[] for d in range(10)}
+    for s in scales:
+        for t in thicks:
+            for d in range(10):
+                canvas=np.zeros((32,24),np.uint8)
+                cv2.putText(canvas,str(d),(2,26),cv2.FONT_HERSHEY_SIMPLEX,s,255,t,cv2.LINE_AA)
+                x,y,w,h=cv2.boundingRect((canvas>0).astype(np.uint8))
+                crop=canvas[y:y+h,x:x+w]
+                if crop.size>0: templates[d].append(crop)
+    _DIGIT_TEMPLATES=templates
+    return templates
 
+def _match_digit(glyph: np.ndarray):
+    tmpls=_make_digit_templates()
+    if glyph is None or glyph.size==0: return 0,-1.0
+    g=cv2.GaussianBlur(glyph,(3,3),0)
+    g=cv2.normalize(g,None,0,255,cv2.NORM_MINMAX)
+    best_d,best=-1,-1.0
+    for d,vars in tmpls.items():
+        for t in vars:
+            th,tw=t.shape[:2]
+            Gh,Gw=g.shape[:2]
+            if min(Gh,Gw)<=0: continue
+            Gs=cv2.resize(g,(tw,th),interpolation=cv2.INTER_AREA)
+            res=cv2.matchTemplate(Gs,t,cv2.TM_CCOEFF_NORMED)
+            score=float(res.max()) if res.size else -1.0
+            if score>best: best, best_d = score, d
+    return best_d,best
 
-# ---- Chinese numerals (Trad/Simp) ----
-_CH_DIG = {"零": 0, "〇": 0, "一": 1, "二": 2, "兩": 2, "两": 2, "三": 3, "四": 4,
-           "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000}
-_BIG_UNITS = {"萬": 10_000, "万": 10_000, "億": 100_000_000, "亿": 100_000_000, "兆": 1_000_000_000_000}
+def _read_weight_near(img_bgr, pt):
+    H,W=img_bgr.shape[:2]; x,y=int(pt[0]),int(pt[1])
+    sz=max(24,int(0.06*max(H,W)))
+    x0,y0=max(0,x-sz),max(0,y-sz); x1,y1=min(W,x+sz),min(H,y+sz)
+    roi=img_bgr[y0:y1,x0:x1]
+    if roi.size==0: return -1
+    hsv=cv2.cvtColor(roi,cv2.COLOR_BGR2HSV); v=hsv[...,2]
+    mask=(v>60).astype(np.uint8)*255
+    kern=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+    mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,kern,iterations=1)
+    cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    boxes=[]
+    for c in cnts:
+        x2,y2,w2,h2=cv2.boundingRect(c)
+        if 8<=w2<=40 and 12<=h2<=45: boxes.append((x2,y2,w2,h2))
+    if not boxes: return -1
+    boxes.sort(key=lambda b:b[0])
+    digits=[]
+    for bx,by,bw,bh in boxes:
+        d,score=_match_digit(cv2.cvtColor(roi[by:by+bh,bx:bx+bw],cv2.COLOR_BGR2GRAY))
+        if score>=0.35: digits.append(str(d))
+    if not digits: return -1
+    try: return int("".join(digits))
+    except: return -1
 
+def _build_graph(img_bgr):
+    nodes=_detect_nodes(img_bgr)
+    if len(nodes)<2: return 2,[(0,1,1)]
+    segs=_detect_line_segments(img_bgr)
+    pairs=_segments_to_edges(nodes,segs,img_bgr.shape)
+    centers=[(x,y) for x,y,_ in nodes]
+    edges=[]
+    for i,j,mid in pairs:
+        w=_read_weight_near(img_bgr,mid)
+        if w>0: edges.append((i,j,int(w)))
+    if len(edges)<max(1,len(nodes)-1):
+        tried={(min(u,v),max(u,v)) for (u,v,_) in edges}
+        for i in range(len(centers)):
+            for j in range(i+1,len(centers)):
+                if (i,j) in tried: continue
+                mid=((centers[i][0]+centers[j][0])//2,(centers[i][1]+centers[j][1])//2)
+                w=_read_weight_near(img_bgr,mid)
+                if w>0: edges.append((i,j,int(w)))
+    best={}
+    for u,v,w in edges:
+        a,b=(u,v) if u<v else (v,u)
+        if (a,b) not in best or w<best[(a,b)]: best[(a,b)]=w
+    dedup=[(a,b,w) for (a,b),w in best.items()]
+    return len(nodes), dedup
 
-def is_chinese_num(s: str) -> bool:
-    return any(c in _CH_DIG or c in _SMALL_UNITS or c in _BIG_UNITS for c in s)
+def _solve_single(img_b64: str) -> int:
+    img=_b64_to_cv(img_b64)
+    n,edges=_build_graph(img)
+    return _mst_weight(n,edges)
 
-
-def chinese_to_int(s: str) -> int:
-    if not s:
-        raise ValueError("not chinese")
-    total = 0
-    section = 0
-    number = 0
-    for ch in s:
-        if ch in _CH_DIG:
-            number = _CH_DIG[ch]
-        elif ch in _SMALL_UNITS:
-            unit = _SMALL_UNITS[ch]
-            section += (number if number != 0 else 1) * unit
-            number = 0
-        elif ch in _BIG_UNITS:
-            unit = _BIG_UNITS[ch]
-            section += number
-            total += section * unit
-            section = 0
-            number = 0
-        else:
-            raise ValueError("not chinese")
-    section += number
-    return total + section
-
-
-def chinese_variant(s: str) -> str:
-    # default ambiguous forms to Traditional for the tie-break order
-    if any(c in ("萬", "億", "兩") for c in s):
-        return "trad_chinese"
-    if any(c in ("万", "亿", "两") for c in s):
-        return "simp_chinese"
-    return "trad_chinese"
-
-
-# ---- German words ----
-def _norm_de(s: str) -> str:
-    s = s.lower().replace(" ", "").replace("-", "")
-    s = s.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
-    return s
-
-
-_DE_UNITS = {
-    "null": 0, "eins": 1, "ein": 1, "eine": 1, "zwei": 2, "drei": 3, "vier": 4,
-    "fuenf": 5, "funf": 5, "sechs": 6, "sieben": 7, "acht": 8, "neun": 9,
-    "zehn": 10, "elf": 11, "zwoelf": 12, "zwoelfe": 12, "zwoelfer": 12,
-    "dreizehn": 13, "vierzehn": 14, "fuenfzehn": 15, "funfzehn": 15,
-    "sechzehn": 16, "siebzehn": 17, "achtzehn": 18, "neunzehn": 19
-}
-_DE_TENS = {
-    "zwanzig": 20, "dreissig": 30, "dreiszig": 30, "dreißig": 30,
-    "vierzig": 40, "fuenfzig": 50, "funfzig": 50, "sechzig": 60,
-    "siebzig": 70, "achtzig": 80, "neunzig": 90
-}
-
-
-def german_to_int(s: str) -> int:
-    if not s:
-        raise ValueError("not german")
-    s = _norm_de(s)
-    # big scales
-    if "tausend" in s:
-        i = s.index("tausend")
-        left, right = s[:i], s[i + 7:]
-        left_val = german_to_int(left) if left else 1
-        return left_val * 1000 + (german_to_int(right) if right else 0)
-    if "hundert" in s:
-        i = s.index("hundert")
-        left, right = s[:i], s[i + 7:]
-        left_val = german_to_int(left) if left else 1
-        return left_val * 100 + (german_to_int(right) if right else 0)
-    if s in _DE_UNITS:
-        return _DE_UNITS[s]
-    if s in _DE_TENS:
-        return _DE_TENS[s]
-    # einundzwanzig pattern: units + 'und' + tens
-    if "und" in s:
-        i = s.rfind("und")
-        units = s[:i]
-        tens = s[i + 3:]
-        if tens in _DE_TENS:
-            u = german_to_int(units)
-            return u + _DE_TENS[tens]
-    raise ValueError("not german")
-
-
-# ---- Detection & parsing ----
-LANG_ORDER = {
-    "roman": 0,
-    "english": 1,
-    "trad_chinese": 2,
-    "simp_chinese": 3,
-    "german": 4,
-    "arabic": 5,
-}
-
-
-def detect_and_parse(s: str):
-    if s is None:
-        raise ValueError("empty")
-    s_stripped = str(s).strip()
-    # Arabic digits
-    if s_stripped.isdigit():
-        return int(s_stripped), "arabic"
-
-    # Roman (accept lowercase -> uppercase for validation)
-    if re.fullmatch(r"[ivxlcdmIVXLCDM]+", s_stripped):
-        return roman_to_int(s_stripped), "roman"
-
-    # Chinese
-    if is_chinese_num(s_stripped):
-        val = chinese_to_int(s_stripped)
-        return val, chinese_variant(s_stripped)
-
-    # English
-    try:
-        return english_to_int(s_stripped), "english"
-    except Exception:
-        pass
-
-    # German
-    try:
-        return german_to_int(s_stripped), "german"
-    except Exception:
-        pass
-
-    raise ValueError(f"Unrecognized numeral: {s_stripped}")
-
-
-# ---- Health & home ----
 @app.get("/healthz")
-def healthz():
-    return "ok", 200
+def healthz(): return "ok", 200
 
+@app.post("/mst-calculation")
+def mst_calculation():
+    data=request.get_json(silent=True)
+    if not isinstance(data,list) or not data:
+        return jsonify({"error":"Body must be a JSON array of {image} objects"}),400
+    out=[]
+    for item in data:
+        b64=(item or {}).get("image")
+        if not isinstance(b64,str):
+            return jsonify({"error":"Each item must include an 'image' base64 string"}),400
+        try: val=_solve_single(b64)
+        except Exception: val=0
+        out.append({"value":int(val)})
+    return jsonify(out),200
 
-@app.get("/")
-def home():
-    return "UBS GCC service. Endpoints: /duolingo-sort, /trading-bot, /healthz", 200
-
-
-# ---- Main Duolingo API ----
-@app.post("/duolingo-sort")
-def duolingo_sort():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "Invalid JSON body"}), 400
-
-    part = str(data.get("part", "")).upper()
-    arr = (data.get("challengeInput") or {}).get("unsortedList", [])
-    if not isinstance(arr, list):
-        return jsonify({"error": "challengeInput.unsortedList must be a list"}), 400
-
-    if part == "ONE":
-        vals = []
-        try:
-            for s in arr:
-                s = str(s).strip()
-                if s.isdigit():
-                    vals.append(int(s))
-                else:
-                    vals.append(roman_to_int(s))
-        except Exception as e:
-            return jsonify({"error": f"Part ONE parse error: {e}"}), 400
-        vals.sort()
-        return jsonify({"sortedList": [str(v) for v in vals]}), 200
-
-    if part == "TWO":
-        items = []
-        for idx, s in enumerate(arr):
-            s0 = str(s).strip()
-            try:
-                v, lang = detect_and_parse(s0)
-            except Exception as e:
-                return jsonify({"error": f"Cannot parse '{s0}': {e}"}), 400
-            items.append((v, LANG_ORDER[lang], idx, s0))
-        items.sort(key=lambda t: (t[0], t[1], t[2]))
-        return jsonify({"sortedList": [t[3] for t in items]}), 200
-
-    return jsonify({"error": "part must be 'ONE' or 'TWO'"}), 400
-
-
-# =========================
-#        TRADING BOT
-# =========================
-def _to_float(x, default=None):
-    try:
-        f = float(x)
-        if math.isfinite(f):
-            return f
-    except Exception:
-        pass
-    return default
-
-
-def _sort_by_ts(lst):
-    return sorted(lst or [], key=lambda c: int(c.get("timestamp", 0)))
-
-
-def _atr(candles):
-    """Average True Range over provided candles; protects against missing data."""
-    cs = _sort_by_ts(candles)
-    if not cs:
-        return 1e-9
-    prev_close = _to_float(cs[0].get("close"), _to_float(cs[0].get("open"), 0.0))
-    trs = []
-    for c in cs:
-        h = _to_float(c.get("high"), prev_close)
-        l = _to_float(c.get("low"), prev_close)
-        cl = _to_float(c.get("close"), prev_close)
-        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-        tr = tr if math.isfinite(tr) else 0.0
-        trs.append(tr)
-        prev_close = cl
-    atr = sum(trs) / max(len(trs), 1)
-    return atr if atr > 1e-9 else 1e-9
-
-
-def _entry_price(obs):
-    """Entry is the close of the first observation candle."""
-    if not obs:
-        return None
-    first = _sort_by_ts(obs)[0]
-    return _to_float(first.get("close"))
-
-
-def _obs_extremes(obs):
-    """Return (maxHigh, minLow, lastClose) from observation candles."""
-    if not obs:
-        return (None, None, None)
-    cs = _sort_by_ts(obs)
-    highs = [_to_float(c.get("high")) for c in cs]
-    lows = [_to_float(c.get("low")) for c in cs]
-    highs = [h for h in highs if h is not None]
-    lows = [l for l in lows if l is not None]
-    last_close = _to_float(cs[-1].get("close"))
-    return (max(highs) if highs else None,
-            min(lows) if lows else None,
-            last_close)
-
-
-def _last_prev_close(prevs):
-    if not prevs:
-        return None
-    cs = _sort_by_ts(prevs)
-    return _to_float(cs[-1].get("close") or cs[-1].get("open"))
-
-
-def _signal_for_event(ev):
-    """Vol-normalized score using immediate post-entry behavior."""
-    prevs = ev.get("previous_candles") or []
-    obs = ev.get("observation_candles") or []
-    entry = _entry_price(obs)
-    if entry is None:
-        return (0.0, False)
-    atr = _atr(prevs)
-    maxH, minL, lastClose = _obs_extremes(obs)
-    lastPrevClose = _last_prev_close(prevs)
-
-    m1 = 0.0 if lastClose is None else (lastClose - entry) / atr  # momentum after entry
-    m2 = 0.0
-    if maxH is not None and minL is not None:
-        m2 = ((maxH - entry) - (entry - minL)) / atr              # skew of extremes
-    m3 = 0.0 if lastPrevClose is None else (entry - lastPrevClose) / atr  # gap
-
-    s = 0.6 * m1 + 0.3 * m2 + 0.1 * m3
-    s = s if math.isfinite(s) else 0.0
-    return (s, True)
-
-
-def _decide_from_score(s, entry, maxH, minL, ev_id):
-    if s > 0:
-        return "LONG"
-    if s < 0:
-        return "SHORT"
-    # tie-break with skew; finally id parity deterministic
-    skew = 0.0
-    if entry is not None and maxH is not None and minL is not None:
-        skew = (maxH - entry) - (entry - minL)
-    if skew > 0:
-        return "LONG"
-    if skew < 0:
-        return "SHORT"
-    return "LONG" if (int(ev_id) % 2 == 0) else "SHORT"
-
-
-@app.post("/trading-bot")
-def trading_bot():
-    """
-    Input: JSON array of events. Each event has 'id', 'previous_candles', 'observation_candles'.
-    Output: EXACTLY 50 items: [{"id": <id>, "decision": "LONG"|"SHORT"}, ...]
-    """
-    data = request.get_json(silent=True)
-    if not isinstance(data, list):
-        return jsonify({"error": "Body must be a JSON array"}), 400
-
-    scored = []
-    for ev in data:
-        try:
-            ev_id = ev.get("id")
-            s, ok = _signal_for_event(ev)
-            if not ok or ev_id is None:
-                continue
-            entry = _entry_price(ev.get("observation_candles") or [])
-            maxH, minL, _ = _obs_extremes(ev.get("observation_candles") or [])
-            scored.append({
-                "id": ev_id,
-                "score": float(s),
-                "abs_score": float(abs(s)),
-                "entry": entry, "maxH": maxH, "minL": minL
-            })
-        except Exception:
-            # skip malformed records
-            continue
-
-    # pick strongest 50 by absolute score (then by id for determinism)
-    scored.sort(key=lambda r: (r["abs_score"], r["id"]), reverse=True)
-    top = scored[:50]
-
-    # backfill deterministically if not enough valid events
-    if len(top) < 50:
-        seen = {r["id"] for r in top}
-        for ev in data:
-            if len(top) >= 50:
-                break
-            ev_id = ev.get("id")
-            if ev_id is None or ev_id in seen:
-                continue
-            top.append({"id": ev_id, "score": 0.0, "abs_score": 0.0,
-                        "entry": None, "maxH": None, "minL": None})
-            seen.add(ev_id)
-
-    out = []
-    for r in top:
-        decision = _decide_from_score(r["score"], r["entry"], r["maxH"], r["minL"], r["id"])
-        out.append({"id": r["id"], "decision": decision})
-
-    # ensure deterministic order: strongest first, then id
-    abs_map = {r["id"]: r["abs_score"] for r in top}
-    out.sort(key=lambda x: (abs_map.get(x["id"], 0.0), x["id"]), reverse=True)
-    return jsonify(out), 200
-
-# ==== Fog of Wall ====
-
-from collections import deque
-
-_FOW_GAMES = {}
-DIRS = {"N": (0, -1), "S": (0, 1), "E": (1, 0), "W": (-1, 0)}
-DIR_BY_STEP = {(0, -1): "N", (0, 1): "S", (1, 0): "E", (-1, 0): "W"}
-
-def _inside(x, y, N):
-    return 0 <= x < N and 0 <= y < N
-
-class GameState:
-    def __init__(self, game_id, num_walls, N, crows):
-        self.game_id = str(game_id)
-        self.N = int(N)
-        self.num_walls = int(num_walls)
-        self.crows = {str(c["id"]): (int(c["x"]), int(c["y"])) for c in crows}
-        self.walls = set()
-        self.empty = set()
-        for pos in self.crows.values():
-            self.empty.add(pos)
-        self.scanned_here = set()
-        self.paths = {cid: [] for cid in self.crows}
-        self.turn_index = 0
-        self.last_pos_before_move = {}
-
-    def _parse_move_result(mr, old):
-        if mr is None:
-            return old
-        if isinstance(mr, dict):
-            x = mr.get("x", old[0] if old else 0)
-            y = mr.get("y", old[1] if old else 0)
-            return (x, y)
-        if isinstance(mr, (list, tuple)) and len(mr) >= 2:
-            return (mr[0], mr[1])
-        if isinstance(mr, str) and "," in mr:
-            a, b = mr.split(",", 1)
-            return (a.strip(), b.strip())
-        return old
-
-    def apply_previous_action(self, prev):
-        if not prev:
-            return
-        act = str(prev.get("your_action", "")).lower()
-        cid = str(prev.get("crow_id"))
-        if act == "move":
-            old = self.crows.get(cid)
-            mr = prev.get("move_result", None)
-            nx, ny = _parse_move_result(mr, old)
-            try:
-                nx, ny = int(nx), int(ny)
-            except Exception:
-                nx, ny = old if old else (0, 0)
-
-            if old is not None and (nx, ny) == old:
-                d = str(prev.get("direction", "")).upper()
-                if d in DIRS:
-                    dx, dy = DIRS[d]
-                    wx, wy = old[0] + dx, old[1] + dy
-                    if _inside(wx, wy, self.N):
-                        self.walls.add((wx, wy))
-
-            self.crows[cid] = (nx, ny)
-            self.empty.add((nx, ny))
-            self.paths[cid] = []
-
-        elif act == "scan":
-            pos = self.crows.get(cid)
-            grid = prev.get("scan_result") or []
-            if pos and grid and len(grid) == 5 and all(len(r) == 5 for r in grid):
-                cx, cy = pos
-                self.scanned_here.add(pos)
-                for dy in range(-2, 3):
-                    for dx in range(-2, 3):
-                        sx, sy = cx + dx, cy + dy
-                        if not _inside(sx, sy, self.N):
-                            continue
-                        v = grid[dy + 2][dx + 2]
-                        if str(v).upper() == "W":
-                            self.walls.add((sx, sy))
-                        else:
-                            self.empty.add((sx, sy))
-
-    def _unknown_in_window(self, x, y):
-        cnt = 0
-        for dy in range(-2, 3):
-            for dx in range(-2, 3):
-                sx, sy = x + dx, y + dy
-                if _inside(sx, sy, self.N) and (sx, sy) not in self.walls and (sx, sy) not in self.empty:
-                    cnt += 1
-        return cnt
-
-    def _bfs_path_dirs(self, start, goal):
-        if start == goal:
-            return []
-        q = deque([start])
-        parent = {start: None}
-        while q:
-            x, y = q.popleft()
-            for dx, dy in DIRS.values():
-                nx, ny = x + dx, y + dy
-                if not _inside(nx, ny, self.N):
-                    continue
-                if (nx, ny) in self.walls:
-                    continue
-                if (nx, ny) not in parent:
-                    parent[(nx, ny)] = (x, y)
-                    if (nx, ny) == goal:
-                        q.clear()
-                        break
-                    q.append((nx, ny))
-        if goal not in parent:
-            return None
-        path = []
-        cur = goal
-        while parent[cur] is not None:
-            px, py = parent[cur]
-            dx, dy = cur[0] - px, cur[1] - py
-            path.append(DIR_BY_STEP[(dx, dy)])
-            cur = parent[cur]
-        path.reverse()
-        return path
-
-    def _best_target_for(self, cid):
-        sx, sy = self.crows[cid]
-        best = (None, 0.0, None)
-        for y in range(self.N):
-            for x in range(self.N):
-                gain = self._unknown_in_window(x, y)
-                if gain <= 0:
-                    continue
-                path = self._bfs_path_dirs((sx, sy), (x, y))
-                if path is None:
-                    continue
-                score = gain / (len(path) + 1.0)
-                if score > best[1]:
-                    best = (path, score, (x, y))
-        return best
-
-    def decide(self):
-        if len(self.walls) >= self.num_walls:
-            sub = [f"{x}-{y}" for (x, y) in sorted(self.walls)]
-            return {"action_type": "submit", "submission": sub}
-
-        cids = sorted(self.crows.keys())
-        n = len(cids)
-
-        best_scan = None
-        for i in range(n):
-            cid = cids[(self.turn_index + i) % n]
-            pos = self.crows[cid]
-            if pos in self.scanned_here:
-                continue
-            if self._unknown_in_window(*pos) > 0:
-                best_scan = cid
-                break
-        if best_scan:
-            self.turn_index = (cids.index(best_scan) + 1) % n
-            self.scanned_here.add(self.crows[best_scan])
-            return {"action_type": "scan", "crow_id": best_scan}
-
-        for i in range(n):
-            cid = cids[(self.turn_index + i) % n]
-            if self.paths.get(cid):
-                d = self.paths[cid].pop(0)
-                self.turn_index = (cids.index(cid) + 1) % n
-                return {"action_type": "move", "crow_id": cid, "direction": d}
-
-        choices = []
-        for i in range(n):
-            cid = cids[(self.turn_index + i) % n]
-            path, score, target = self._best_target_for(cid)
-            if path:
-                choices.append((score, cid, path))
-        if choices:
-            choices.sort(reverse=True)
-            _, cid, path = choices[0]
-            self.paths[cid] = path
-            d = self.paths[cid].pop(0)
-            self.turn_index = (cids.index(cid) + 1) % n
-            return {"action_type": "move", "crow_id": cid, "direction": d}
-
-        cid = cids[self.turn_index]
-        self.turn_index = (self.turn_index + 1) % n
-        x, y = self.crows[cid]
-        for d, (dx, dy) in DIRS.items():
-            nx, ny = x + dx, y + dy
-            if _inside(nx, ny, self.N) and (nx, ny) not in self.walls:
-                return {"action_type": "move", "crow_id": cid, "direction": d}
-        return {"action_type": "scan", "crow_id": cid}
-
-@app.post("/fog-of-wall")
-def fog_of_wall():
-    body = request.get_json(silent=True) or {}
-    challenger_id = str(body.get("challenger_id", ""))
-    game_id = str(body.get("game_id", ""))
-
-    tc = body.get("test_case")
-    if tc:
-        state = GameState(
-            game_id=tc.get("game_id", game_id),
-            num_walls=tc.get("num_of_walls"),
-            N=tc.get("length_of_grid"),
-            crows=tc.get("crows") or [],
-        )
-        _FOW_GAMES[state.game_id] = state
-    else:
-        state = _FOW_GAMES.get(game_id)
-        if not state:
-            return jsonify({"error": "unknown game_id and no test_case"}), 400
-
-    prev = body.get("previous_action")
-    state.apply_previous_action(prev)
-
-    action = state.decide()
-    action.update({"challenger_id": challenger_id, "game_id": state.game_id})
-    return jsonify(action), 200
-
-# =========================
-#        ENTRY POINT
-# =========================
 if __name__ == "__main__":
+    import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+
 
 
 
