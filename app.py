@@ -451,25 +451,46 @@ class GameState:
         self.turn_index = 0
         self.last_pos_before_move = {}
 
+    def _parse_move_result(mr, old):
+        if mr is None:
+            return old
+        if isinstance(mr, dict):
+            x = mr.get("x", old[0] if old else 0)
+            y = mr.get("y", old[1] if old else 0)
+            return (x, y)
+        if isinstance(mr, (list, tuple)) and len(mr) >= 2:
+            return (mr[0], mr[1])
+        if isinstance(mr, str) and "," in mr:
+            a, b = mr.split(",", 1)
+            return (a.strip(), b.strip())
+        return old
+
     def apply_previous_action(self, prev):
         if not prev:
             return
-        act = prev.get("your_action")
+        act = str(prev.get("your_action", "")).lower()
         cid = str(prev.get("crow_id"))
         if act == "move":
             old = self.crows.get(cid)
-            nx, ny = prev.get("move_result", old)
-            nx, ny = int(nx), int(ny)
+            mr = prev.get("move_result", None)
+            nx, ny = _parse_move_result(mr, old)
+            try:
+                nx, ny = int(nx), int(ny)
+            except Exception:
+                nx, ny = old if old else (0, 0)
+
             if old is not None and (nx, ny) == old:
-                d = prev.get("direction")
+                d = str(prev.get("direction", "")).upper()
                 if d in DIRS:
                     dx, dy = DIRS[d]
                     wx, wy = old[0] + dx, old[1] + dy
                     if _inside(wx, wy, self.N):
                         self.walls.add((wx, wy))
+
             self.crows[cid] = (nx, ny)
             self.empty.add((nx, ny))
             self.paths[cid] = []
+
         elif act == "scan":
             pos = self.crows.get(cid)
             grid = prev.get("scan_result") or []
@@ -482,7 +503,7 @@ class GameState:
                         if not _inside(sx, sy, self.N):
                             continue
                         v = grid[dy + 2][dx + 2]
-                        if v == "W":
+                        if str(v).upper() == "W":
                             self.walls.add((sx, sy))
                         else:
                             self.empty.add((sx, sy))
