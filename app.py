@@ -425,10 +425,209 @@ def trading_bot():
     out.sort(key=lambda x: (abs_map.get(x["id"], 0.0), x["id"]), reverse=True)
     return jsonify(out), 200
 
+# ==== Fog of Wall ====
+
+from collections import deque
+
+_FOW_GAMES = {}
+DIRS = {"N": (0, -1), "S": (0, 1), "E": (1, 0), "W": (-1, 0)}
+DIR_BY_STEP = {(0, -1): "N", (0, 1): "S", (1, 0): "E", (-1, 0): "W"}
+
+def _inside(x, y, N):
+    return 0 <= x < N and 0 <= y < N
+
+class GameState:
+    def __init__(self, game_id, num_walls, N, crows):
+        self.game_id = str(game_id)
+        self.N = int(N)
+        self.num_walls = int(num_walls)
+        self.crows = {str(c["id"]): (int(c["x"]), int(c["y"])) for c in crows}
+        self.walls = set()
+        self.empty = set()
+        for pos in self.crows.values():
+            self.empty.add(pos)
+        self.scanned_here = set()
+        self.paths = {cid: [] for cid in self.crows}
+        self.turn_index = 0
+        self.last_pos_before_move = {}
+
+    def apply_previous_action(self, prev):
+        if not prev:
+            return
+        act = prev.get("your_action")
+        cid = str(prev.get("crow_id"))
+        if act == "move":
+            old = self.crows.get(cid)
+            nx, ny = prev.get("move_result", old)
+            nx, ny = int(nx), int(ny)
+            if old is not None and (nx, ny) == old:
+                d = prev.get("direction")
+                if d in DIRS:
+                    dx, dy = DIRS[d]
+                    wx, wy = old[0] + dx, old[1] + dy
+                    if _inside(wx, wy, self.N):
+                        self.walls.add((wx, wy))
+            self.crows[cid] = (nx, ny)
+            self.empty.add((nx, ny))
+            self.paths[cid] = []
+        elif act == "scan":
+            pos = self.crows.get(cid)
+            grid = prev.get("scan_result") or []
+            if pos and grid and len(grid) == 5 and all(len(r) == 5 for r in grid):
+                cx, cy = pos
+                self.scanned_here.add(pos)
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        sx, sy = cx + dx, cy + dy
+                        if not _inside(sx, sy, self.N):
+                            continue
+                        v = grid[dy + 2][dx + 2]
+                        if v == "W":
+                            self.walls.add((sx, sy))
+                        else:
+                            self.empty.add((sx, sy))
+
+    def _unknown_in_window(self, x, y):
+        cnt = 0
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                sx, sy = x + dx, y + dy
+                if _inside(sx, sy, self.N) and (sx, sy) not in self.walls and (sx, sy) not in self.empty:
+                    cnt += 1
+        return cnt
+
+    def _bfs_path_dirs(self, start, goal):
+        if start == goal:
+            return []
+        q = deque([start])
+        parent = {start: None}
+        while q:
+            x, y = q.popleft()
+            for dx, dy in DIRS.values():
+                nx, ny = x + dx, y + dy
+                if not _inside(nx, ny, self.N):
+                    continue
+                if (nx, ny) in self.walls:
+                    continue
+                if (nx, ny) not in parent:
+                    parent[(nx, ny)] = (x, y)
+                    if (nx, ny) == goal:
+                        q.clear()
+                        break
+                    q.append((nx, ny))
+        if goal not in parent:
+            return None
+        path = []
+        cur = goal
+        while parent[cur] is not None:
+            px, py = parent[cur]
+            dx, dy = cur[0] - px, cur[1] - py
+            path.append(DIR_BY_STEP[(dx, dy)])
+            cur = parent[cur]
+        path.reverse()
+        return path
+
+    def _best_target_for(self, cid):
+        sx, sy = self.crows[cid]
+        best = (None, 0.0, None)
+        for y in range(self.N):
+            for x in range(self.N):
+                gain = self._unknown_in_window(x, y)
+                if gain <= 0:
+                    continue
+                path = self._bfs_path_dirs((sx, sy), (x, y))
+                if path is None:
+                    continue
+                score = gain / (len(path) + 1.0)
+                if score > best[1]:
+                    best = (path, score, (x, y))
+        return best
+
+    def decide(self):
+        if len(self.walls) >= self.num_walls:
+            sub = [f"{x}-{y}" for (x, y) in sorted(self.walls)]
+            return {"action_type": "submit", "submission": sub}
+
+        cids = sorted(self.crows.keys())
+        n = len(cids)
+
+        best_scan = None
+        for i in range(n):
+            cid = cids[(self.turn_index + i) % n]
+            pos = self.crows[cid]
+            if pos in self.scanned_here:
+                continue
+            if self._unknown_in_window(*pos) > 0:
+                best_scan = cid
+                break
+        if best_scan:
+            self.turn_index = (cids.index(best_scan) + 1) % n
+            self.scanned_here.add(self.crows[best_scan])
+            return {"action_type": "scan", "crow_id": best_scan}
+
+        for i in range(n):
+            cid = cids[(self.turn_index + i) % n]
+            if self.paths.get(cid):
+                d = self.paths[cid].pop(0)
+                self.turn_index = (cids.index(cid) + 1) % n
+                return {"action_type": "move", "crow_id": cid, "direction": d}
+
+        choices = []
+        for i in range(n):
+            cid = cids[(self.turn_index + i) % n]
+            path, score, target = self._best_target_for(cid)
+            if path:
+                choices.append((score, cid, path))
+        if choices:
+            choices.sort(reverse=True)
+            _, cid, path = choices[0]
+            self.paths[cid] = path
+            d = self.paths[cid].pop(0)
+            self.turn_index = (cids.index(cid) + 1) % n
+            return {"action_type": "move", "crow_id": cid, "direction": d}
+
+        cid = cids[self.turn_index]
+        self.turn_index = (self.turn_index + 1) % n
+        x, y = self.crows[cid]
+        for d, (dx, dy) in DIRS.items():
+            nx, ny = x + dx, y + dy
+            if _inside(nx, ny, self.N) and (nx, ny) not in self.walls:
+                return {"action_type": "move", "crow_id": cid, "direction": d}
+        return {"action_type": "scan", "crow_id": cid}
+
+@app.post("/fog-of-wall")
+def fog_of_wall():
+    body = request.get_json(silent=True) or {}
+    challenger_id = str(body.get("challenger_id", ""))
+    game_id = str(body.get("game_id", ""))
+
+    tc = body.get("test_case")
+    if tc:
+        state = GameState(
+            game_id=tc.get("game_id", game_id),
+            num_walls=tc.get("num_of_walls"),
+            N=tc.get("length_of_grid"),
+            crows=tc.get("crows") or [],
+        )
+        _FOW_GAMES[state.game_id] = state
+    else:
+        state = _FOW_GAMES.get(game_id)
+        if not state:
+            return jsonify({"error": "unknown game_id and no test_case"}), 400
+
+    prev = body.get("previous_action")
+    state.apply_previous_action(prev)
+
+    action = state.decide()
+    action.update({"challenger_id": challenger_id, "game_id": state.game_id})
+    return jsonify(action), 200
 
 # =========================
 #        ENTRY POINT
 # =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+
+
+
 
